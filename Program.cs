@@ -12,6 +12,7 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddScoped<ICompatDbService, CompatDbService>();
+builder.Services.AddScoped<IEmailService, NullEmailService>();
 
 var authority = builder.Configuration["Auth:Authority"];
 var audience = builder.Configuration["Auth:Audience"];
