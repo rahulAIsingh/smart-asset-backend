@@ -19,22 +19,21 @@ public class CompatDbService : ICompatDbService
 
     public async Task<IReadOnlyList<object>> ListAsync(string entity, CompatListRequest request, CancellationToken cancellationToken)
     {
-        var rows = entity.ToLowerInvariant() switch
+        IEnumerable<object> list = entity.ToLowerInvariant() switch
         {
-            "users" => await _db.Users.AsNoTracking().ToListAsync(cancellationToken),
-            "assets" => await _db.Assets.AsNoTracking().ToListAsync(cancellationToken),
-            "issuances" => await _db.Issuances.AsNoTracking().ToListAsync(cancellationToken),
-            "maintenance" => await _db.Maintenance.AsNoTracking().ToListAsync(cancellationToken),
-            "stocktransactions" => await _db.StockTransactions.AsNoTracking().ToListAsync(cancellationToken),
-            "categories" => await _db.Categories.AsNoTracking().ToListAsync(cancellationToken),
-            "departments" => await _db.Departments.AsNoTracking().ToListAsync(cancellationToken),
-            "vendors" => await _db.Vendors.AsNoTracking().ToListAsync(cancellationToken),
-            "financeprofiles" => await _db.FinanceProfiles.AsNoTracking().ToListAsync(cancellationToken),
-            "financeassetoverrides" => await _db.FinanceAssetOverrides.AsNoTracking().ToListAsync(cancellationToken),
+            "users" => (await _db.Users.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "assets" => (await _db.Assets.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "issuances" => (await _db.Issuances.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "maintenance" => (await _db.Maintenance.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "stocktransactions" => (await _db.StockTransactions.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "categories" => (await _db.Categories.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "departments" => (await _db.Departments.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "vendors" => (await _db.Vendors.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "financeprofiles" => (await _db.FinanceProfiles.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
+            "financeassetoverrides" => (await _db.FinanceAssetOverrides.AsNoTracking().ToListAsync(cancellationToken)).Cast<object>(),
             _ => throw new InvalidOperationException($"Unsupported entity '{entity}'.")
         };
 
-        IEnumerable<object> list = rows.Cast<object>();
         if (request.Where is { Count: > 0 })
         {
             list = list.Where(item => MatchesWhere(item, request.Where));
@@ -59,7 +58,7 @@ public class CompatDbService : ICompatDbService
 
     public async Task<object> CreateAsync(string entity, JsonElement payload, CancellationToken cancellationToken)
     {
-        var row = entity.ToLowerInvariant() switch
+        object row = entity.ToLowerInvariant() switch
         {
             "users" => Add(JsonSerializer.Deserialize<UserEntity>(payload.GetRawText(), JsonOptions)!, _db.Users),
             "assets" => Add(JsonSerializer.Deserialize<AssetEntity>(payload.GetRawText(), JsonOptions)!, _db.Assets),
@@ -80,7 +79,7 @@ public class CompatDbService : ICompatDbService
 
     public async Task<object?> UpdateAsync(string entity, string id, JsonElement payload, CancellationToken cancellationToken)
     {
-        var target = entity.ToLowerInvariant() switch
+        object? target = entity.ToLowerInvariant() switch
         {
             "users" => await _db.Users.FindAsync([id], cancellationToken),
             "assets" => await _db.Assets.FindAsync([id], cancellationToken),
