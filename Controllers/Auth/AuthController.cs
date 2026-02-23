@@ -1,4 +1,5 @@
-﻿using System.Security.Claims;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -14,7 +15,8 @@ public class AuthController : ControllerBase
     {
         var email = User.FindFirstValue(ClaimTypes.Email)
                     ?? User.FindFirstValue("preferred_username")
-                    ?? User.FindFirstValue("upn");
+                    ?? User.FindFirstValue("upn")
+                    ?? User.FindFirstValue("unique_name");
         var id = User.FindFirstValue(ClaimTypes.NameIdentifier) ?? email ?? "unknown";
         var displayName = User.FindFirstValue("name") ?? User.Identity?.Name ?? email;
 
@@ -35,5 +37,36 @@ public class AuthController : ControllerBase
                 roles
             }
         });
+    }
+
+    [Authorize]
+    [HttpGet("debug-token")]
+    public IActionResult DebugToken()
+    {
+        var auth = Request.Headers.Authorization.ToString();
+        if (string.IsNullOrWhiteSpace(auth) || !auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest(new { error = "Missing bearer token" });
+        }
+
+        var token = auth["Bearer ".Length..].Trim();
+        try
+        {
+            var handler = new JwtSecurityTokenHandler();
+            var jwt = handler.ReadJwtToken(token);
+            return Ok(new
+            {
+                aud = jwt.Audiences.FirstOrDefault(),
+                iss = jwt.Issuer,
+                tid = jwt.Claims.FirstOrDefault(c => c.Type == "tid")?.Value,
+                scp = jwt.Claims.FirstOrDefault(c => c.Type == "scp")?.Value,
+                roles = jwt.Claims.Where(c => c.Type == "roles").Select(c => c.Value).ToArray(),
+                exp = jwt.Claims.FirstOrDefault(c => c.Type == "exp")?.Value
+            });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = "Token parse failed", detail = ex.Message });
+        }
     }
 }

@@ -32,6 +32,10 @@ public class AppDbContext : DbContext
             entity.HasKey(x => x.Id);
             entity.Property(x => x.Email).HasMaxLength(320).IsRequired();
             entity.Property(x => x.Role).HasMaxLength(32).IsRequired();
+            entity.Property(x => x.ManagerEmail).HasMaxLength(320);
+            entity.Property(x => x.BossEmail).HasMaxLength(320);
+            entity.Property(x => x.ReportingToEmail).HasMaxLength(320);
+            entity.Property(x => x.BossApproverEmail).HasMaxLength(320);
             entity.HasIndex(x => x.Email).IsUnique();
         });
 
@@ -42,8 +46,17 @@ public class AppDbContext : DbContext
             entity.Property(x => x.Name).HasMaxLength(255).IsRequired();
             entity.Property(x => x.Category).HasMaxLength(100).IsRequired();
             entity.Property(x => x.SerialNumber).HasMaxLength(255);
+            entity.Property(x => x.DeviceSerialNumber).HasMaxLength(255);
+            entity.Property(x => x.Company).HasMaxLength(255);
+            entity.Property(x => x.Model).HasMaxLength(255);
+            entity.Property(x => x.Department).HasMaxLength(128);
+            entity.Property(x => x.WarrantyStart).HasMaxLength(64);
+            entity.Property(x => x.WarrantyEnd).HasMaxLength(64);
+            entity.Property(x => x.WarrantyVendor).HasMaxLength(255);
+            entity.Property(x => x.Configuration).HasMaxLength(4000);
             entity.Property(x => x.Status).HasMaxLength(50).IsRequired();
             entity.HasIndex(x => x.SerialNumber).IsUnique();
+            entity.HasIndex(x => x.DeviceSerialNumber);
         });
 
         modelBuilder.Entity<IssuanceEntity>(entity =>

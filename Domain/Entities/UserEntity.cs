@@ -8,6 +8,10 @@ public class UserEntity
     public string? Department { get; set; }
     public string? Name { get; set; }
     public string? Avatar { get; set; }
+    public string? ManagerEmail { get; set; }
+    public string? BossEmail { get; set; }
+    public string? ReportingToEmail { get; set; }
+    public string? BossApproverEmail { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

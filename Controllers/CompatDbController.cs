@@ -1,5 +1,9 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 using System.Text.Json;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using SmartAssetManager.Api.Data;
 using SmartAssetManager.Api.Models.Compat;
 using SmartAssetManager.Api.Services;
 
@@ -7,13 +11,16 @@ namespace SmartAssetManager.Api.Controllers;
 
 [ApiController]
 [Route("api/compat/db")]
+[Authorize]
 public class CompatDbController : ControllerBase
 {
     private readonly ICompatDbService _service;
+    private readonly AppDbContext _db;
 
-    public CompatDbController(ICompatDbService service)
+    public CompatDbController(ICompatDbService service, AppDbContext db)
     {
         _service = service;
+        _db = db;
     }
 
     [HttpPost("{entity}/list")]
@@ -47,6 +54,27 @@ public class CompatDbController : ControllerBase
     [HttpPost("batch")]
     public async Task<IActionResult> Batch([FromBody] CompatBatchRequest request, CancellationToken cancellationToken)
     {
+        var actor = User.FindFirstValue(ClaimTypes.Email)
+                    ?? User.FindFirstValue("preferred_username")
+                    ?? User.FindFirstValue("upn")
+                    ?? User.FindFirstValue("unique_name");
+
+        if (string.IsNullOrWhiteSpace(actor))
+        {
+            return Unauthorized(new { error = "Authenticated user email is required." });
+        }
+
+        var role = await _db.Users.AsNoTracking()
+            .Where(x => x.Email == actor)
+            .Select(x => x.Role)
+            .FirstOrDefaultAsync(cancellationToken);
+        var normalizedRole = string.IsNullOrWhiteSpace(role) ? "user" : role.Trim().ToLowerInvariant();
+
+        if (normalizedRole is not ("admin" or "support"))
+        {
+            return Forbid();
+        }
+
         var affectedRows = await _service.ExecuteBatchAsync(request, cancellationToken);
         return Ok(new { affectedRows });
     }

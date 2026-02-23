@@ -1,5 +1,6 @@
 ﻿using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using SmartAssetManager.Api.Data;
 using SmartAssetManager.Api.Domain.Entities;
@@ -9,6 +10,20 @@ namespace SmartAssetManager.Api.Services;
 
 public class CompatDbService : ICompatDbService
 {
+    private static readonly string[] AllowedBatchPrefixes =
+    [
+        "create table",
+        "create unique index",
+        "insert into",
+        "update ",
+        "delete from"
+    ];
+
+    private static readonly Regex DangerousSqlPattern = new(
+        @"(--|/\*|\*/|\b(exec|execute|xp_|sp_|drop\s+table|drop\s+database|truncate\s+table|alter\s+login|create\s+login|grant\s+|revoke\s+|deny\s+|union\s+select|waitfor)\b)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex HtmlPattern = new("<[^>]+>", RegexOptions.Compiled);
+
     private readonly AppDbContext _db;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -61,7 +76,7 @@ public class CompatDbService : ICompatDbService
         object row = entity.ToLowerInvariant() switch
         {
             "users" => Add(JsonSerializer.Deserialize<UserEntity>(payload.GetRawText(), JsonOptions)!, _db.Users),
-            "assets" => Add(JsonSerializer.Deserialize<AssetEntity>(payload.GetRawText(), JsonOptions)!, _db.Assets),
+            "assets" => Add(NormalizeAndValidateAsset(JsonSerializer.Deserialize<AssetEntity>(payload.GetRawText(), JsonOptions)!), _db.Assets),
             "issuances" => Add(JsonSerializer.Deserialize<IssuanceEntity>(payload.GetRawText(), JsonOptions)!, _db.Issuances),
             "maintenance" => Add(JsonSerializer.Deserialize<MaintenanceEntity>(payload.GetRawText(), JsonOptions)!, _db.Maintenance),
             "stocktransactions" => Add(JsonSerializer.Deserialize<StockTransactionEntity>(payload.GetRawText(), JsonOptions)!, _db.StockTransactions),
@@ -96,6 +111,12 @@ public class CompatDbService : ICompatDbService
 
         if (target is null) return null;
         ApplyPatch(target, payload);
+        if (target is AssetEntity asset)
+        {
+            NormalizeAndValidateAsset(asset);
+            asset.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+
         await _db.SaveChangesAsync(cancellationToken);
         return target;
     }
@@ -105,7 +126,7 @@ public class CompatDbService : ICompatDbService
         var deleted = entity.ToLowerInvariant() switch
         {
             "users" => await DeleteById(_db.Users, id, cancellationToken),
-            "assets" => await DeleteById(_db.Assets, id, cancellationToken),
+            "assets" => await DeleteAssetById(id, cancellationToken),
             "issuances" => await DeleteById(_db.Issuances, id, cancellationToken),
             "maintenance" => await DeleteById(_db.Maintenance, id, cancellationToken),
             "stocktransactions" => await DeleteById(_db.StockTransactions, id, cancellationToken),
@@ -122,18 +143,57 @@ public class CompatDbService : ICompatDbService
         return true;
     }
 
+    private async Task<bool> DeleteAssetById(string id, CancellationToken cancellationToken)
+    {
+        var asset = await _db.Assets.FindAsync([id], cancellationToken);
+        if (asset is null) return false;
+
+        var issuances = await _db.Issuances.Where(x => x.AssetId == id).ToListAsync(cancellationToken);
+        var maintenance = await _db.Maintenance.Where(x => x.AssetId == id).ToListAsync(cancellationToken);
+        var stockTransactions = await _db.StockTransactions.Where(x => x.AssetId == id).ToListAsync(cancellationToken);
+        var financeOverrides = await _db.FinanceAssetOverrides.Where(x => x.AssetId == id).ToListAsync(cancellationToken);
+
+        if (issuances.Count > 0) _db.Issuances.RemoveRange(issuances);
+        if (maintenance.Count > 0) _db.Maintenance.RemoveRange(maintenance);
+        if (stockTransactions.Count > 0) _db.StockTransactions.RemoveRange(stockTransactions);
+        if (financeOverrides.Count > 0) _db.FinanceAssetOverrides.RemoveRange(financeOverrides);
+
+        _db.Assets.Remove(asset);
+        return true;
+    }
+
     public async Task<int> ExecuteBatchAsync(CompatBatchRequest request, CancellationToken cancellationToken)
     {
         if (request.Statements.Count == 0) return 0;
+
+        if (!string.Equals(request.Mode, "write", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Only write mode is supported for batch execution.");
+        }
 
         var affected = 0;
         foreach (var statement in request.Statements)
         {
             if (string.IsNullOrWhiteSpace(statement.Sql)) continue;
-            affected += await _db.Database.ExecuteSqlRawAsync(statement.Sql, cancellationToken);
+
+            var sql = statement.Sql.Trim();
+            if (!IsAllowedBatchStatement(sql))
+            {
+                throw new InvalidOperationException("Batch statement blocked by SQL safety policy.");
+            }
+
+            affected += await _db.Database.ExecuteSqlRawAsync(sql, cancellationToken);
         }
 
         return affected;
+    }
+
+    private static bool IsAllowedBatchStatement(string sql)
+    {
+        if (DangerousSqlPattern.IsMatch(sql)) return false;
+
+        var normalized = Regex.Replace(sql.Trim(), @"\s+", " ").ToLowerInvariant();
+        return AllowedBatchPrefixes.Any(prefix => normalized.StartsWith(prefix, StringComparison.Ordinal));
     }
 
     private static bool MatchesWhere(object item, Dictionary<string, JsonElement> where)
@@ -198,5 +258,79 @@ public class CompatDbService : ICompatDbService
             var nextValue = JsonElementToDotNet(property.Value, propInfo.PropertyType);
             propInfo.SetValue(target, nextValue);
         }
+    }
+
+    private static AssetEntity NormalizeAndValidateAsset(AssetEntity asset)
+    {
+        asset.Name = (asset.Name ?? string.Empty).Trim();
+        asset.Category = (asset.Category ?? string.Empty).Trim();
+        asset.SerialNumber = NormalizeNullable(asset.SerialNumber);
+        asset.DeviceSerialNumber = NormalizeNullable(asset.DeviceSerialNumber);
+        asset.Company = NormalizeNullable(asset.Company);
+        asset.Model = NormalizeNullable(asset.Model);
+        asset.Department = NormalizeNullable(asset.Department);
+        asset.WarrantyStart = NormalizeNullable(asset.WarrantyStart);
+        asset.WarrantyEnd = NormalizeNullable(asset.WarrantyEnd);
+        asset.WarrantyVendor = NormalizeNullable(asset.WarrantyVendor);
+        asset.Configuration = NormalizeNullable(asset.Configuration);
+        asset.Location = NormalizeNullable(asset.Location);
+        asset.Status = string.IsNullOrWhiteSpace(asset.Status) ? "available" : asset.Status.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrWhiteSpace(asset.Name))
+        {
+            throw new InvalidOperationException("Asset name is required.");
+        }
+
+        if (string.IsNullOrWhiteSpace(asset.Category))
+        {
+            throw new InvalidOperationException("Asset category is required.");
+        }
+
+        var unsafeField = FindUnsafeTextField(asset);
+        if (unsafeField is not null)
+        {
+            throw new InvalidOperationException($"Invalid text in '{unsafeField}'. HTML/script input is not allowed.");
+        }
+
+        return asset;
+    }
+
+    private static string? FindUnsafeTextField(AssetEntity asset)
+    {
+        return FindUnsafeTextFieldCore(
+            ("name", asset.Name),
+            ("category", asset.Category),
+            ("serialNumber", asset.SerialNumber),
+            ("deviceSerialNumber", asset.DeviceSerialNumber),
+            ("company", asset.Company),
+            ("model", asset.Model),
+            ("department", asset.Department),
+            ("warrantyStart", asset.WarrantyStart),
+            ("warrantyEnd", asset.WarrantyEnd),
+            ("warrantyVendor", asset.WarrantyVendor),
+            ("configuration", asset.Configuration),
+            ("location", asset.Location),
+            ("status", asset.Status)
+        );
+    }
+
+    private static string? FindUnsafeTextFieldCore(params (string Name, string? Value)[] fields)
+    {
+        foreach (var field in fields)
+        {
+            if (string.IsNullOrWhiteSpace(field.Value)) continue;
+            if (HtmlPattern.IsMatch(field.Value))
+            {
+                return field.Name;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeNullable(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        return value.Trim();
     }
 }

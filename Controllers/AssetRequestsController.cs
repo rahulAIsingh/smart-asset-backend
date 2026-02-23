@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Authorization;
+using System.Security.Claims;
 using SmartAssetManager.Api.Data;
 using SmartAssetManager.Api.Domain.Entities;
 using SmartAssetManager.Api.Models.Requests;
@@ -9,6 +11,7 @@ namespace SmartAssetManager.Api.Controllers;
 
 [ApiController]
 [Route("api/requests")]
+[Authorize]
 public class AssetRequestsController : ControllerBase
 {
     private static readonly HashSet<string> AllowedTypes = new(StringComparer.OrdinalIgnoreCase)
@@ -60,6 +63,9 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = validationError });
         }
 
+        var requesterRole = await GetActorRoleAsync(dto.RequesterEmail.Trim(), cancellationToken);
+        var startsAtBossApproval = string.Equals(requesterRole, "pm", StringComparison.OrdinalIgnoreCase);
+
         var now = DateTimeOffset.UtcNow;
         var request = new AssetRequestEntity
         {
@@ -75,8 +81,8 @@ public class AssetRequestsController : ControllerBase
             Location = dto.Location.Trim(),
             BusinessJustification = dto.BusinessJustification.Trim(),
             Urgency = normalizedUrgency,
-            Status = "pending_pm",
-            CurrentApprovalLevel = "pm",
+            Status = startsAtBossApproval ? "pending_boss" : "pending_pm",
+            CurrentApprovalLevel = startsAtBossApproval ? "boss" : "pm",
             PmApproverEmail = dto.PmApproverEmail.Trim(),
             BossApproverEmail = dto.BossApproverEmail.Trim(),
             DestinationUserEmail = TrimOrNull(dto.DestinationUserEmail),
@@ -113,7 +119,22 @@ public class AssetRequestsController : ControllerBase
 
         _db.AssetRequests.Add(request);
 
-        await AddNotificationAsync(request.Id, request.PmApproverEmail, "in_app", "request_submitted", cancellationToken);
+        if (startsAtBossApproval)
+        {
+            _db.AssetRequestApprovals.Add(NewApproval(
+                request.Id,
+                "pm",
+                request.PmApproverEmail,
+                "approved",
+                "PM stage auto-approved because requester role is PM."
+            ));
+            await AddNotificationAsync(request.Id, request.BossApproverEmail, "in_app", "request_submitted", cancellationToken);
+            await AddNotificationAsync(request.Id, request.RequesterEmail, "in_app", "pm_approved", cancellationToken);
+        }
+        else
+        {
+            await AddNotificationAsync(request.Id, request.PmApproverEmail, "in_app", "request_submitted", cancellationToken);
+        }
         await AddNotificationAsync(request.Id, request.RequesterEmail, "in_app", "request_submitted", cancellationToken);
 
         if (normalizedType == "loss_theft")
@@ -128,13 +149,28 @@ public class AssetRequestsController : ControllerBase
             request,
             "created",
             request.RequesterEmail,
-            "user",
+            requesterRole,
             null,
             request.Status,
             "submitted",
             "Request submitted",
             cancellationToken
         );
+
+        if (startsAtBossApproval)
+        {
+            await WriteAuditAsync(
+                request,
+                "approved",
+                request.PmApproverEmail,
+                "pm",
+                "pending_pm",
+                "pending_boss",
+                "approved",
+                "PM stage auto-approved because requester role is PM.",
+                cancellationToken
+            );
+        }
 
         return Ok(request);
     }
@@ -308,8 +344,9 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "Approval reason is required." });
         }
 
-        var actor = dto.ActorEmail.Trim();
-        var role = Normalize(dto.ActorRole);
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
 
         if (request.Status == "pending_pm")
         {
@@ -365,8 +402,9 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "Rejection reason is required." });
         }
 
-        var actor = dto.ActorEmail.Trim();
-        var role = Normalize(dto.ActorRole);
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
         var now = DateTimeOffset.UtcNow;
         var fromStatus = request.Status;
 
@@ -419,8 +457,9 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "Return reason is required." });
         }
 
-        var actor = dto.ActorEmail.Trim();
-        var role = Normalize(dto.ActorRole);
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
 
         if (request.Status is not ("pending_pm" or "pending_boss" or "pending_it_fulfillment"))
         {
@@ -465,14 +504,21 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "IT fulfill is only valid when status is pending_it_fulfillment." });
         }
 
-        if (!IsIt(Normalize(dto.ActorRole)))
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
+
+        if (!IsIt(role))
         {
             return Forbid();
         }
 
         var now = DateTimeOffset.UtcNow;
         var fromStatus = request.Status;
-        request.Status = "fulfilled";
+        var isReturnRequest = string.Equals(request.RequestType, "return", StringComparison.OrdinalIgnoreCase);
+        request.Status = isReturnRequest ? "closed" : "fulfilled";
+        request.CurrentApprovalLevel = isReturnRequest ? "closed" : "it";
+        request.ClosedAt = isReturnRequest ? now : request.ClosedAt;
         request.UpdatedAt = now;
 
         if (!string.IsNullOrWhiteSpace(dto.AssignedAssetId))
@@ -490,11 +536,53 @@ public class AssetRequestsController : ControllerBase
                 asset.UpdatedAt = now;
             }
         }
+        else if (isReturnRequest && !string.IsNullOrWhiteSpace(request.RelatedAssetId))
+        {
+            var asset = await _db.Assets.FindAsync([request.RelatedAssetId], cancellationToken);
+            if (asset is not null)
+            {
+                asset.Location = "IT_RETURN_RECEIVED";
+                asset.Status = "available";
+                asset.UpdatedAt = now;
+            }
 
-        _db.AssetRequestApprovals.Add(NewApproval(id, "it", dto.ActorEmail, "approved", dto.Comment));
-        await AddNotificationAsync(id, request.RequesterEmail, "in_app", "fulfilled", cancellationToken);
+            var activeIssuances = await _db.Issuances
+                .Where(x =>
+                    x.AssetId == request.RelatedAssetId
+                    && x.UserEmail == request.RequesterEmail
+                    && x.Status == "active")
+                .ToListAsync(cancellationToken);
+
+            foreach (var issuance in activeIssuances)
+            {
+                issuance.Status = "returned";
+                issuance.ReturnDate ??= now;
+                issuance.UpdatedAt = now;
+            }
+        }
+
+        _db.AssetRequestApprovals.Add(NewApproval(id, "it", actor, "approved", dto.Comment));
+        if (isReturnRequest)
+        {
+            await AddNotificationAsync(id, request.RequesterEmail, "in_app", "closed", cancellationToken);
+            await AddNotificationAsync(id, request.PmApproverEmail, "in_app", "closed", cancellationToken);
+            await AddNotificationAsync(id, request.BossApproverEmail, "in_app", "closed", cancellationToken);
+        }
+        else
+        {
+            await AddNotificationAsync(id, request.RequesterEmail, "in_app", "fulfilled", cancellationToken);
+        }
         await _db.SaveChangesAsync(cancellationToken);
-        await WriteAuditAsync(request, "it_fulfilled", dto.ActorEmail, dto.ActorRole, fromStatus, request.Status, "approved", dto.Comment, cancellationToken);
+        await WriteAuditAsync(
+            request,
+            isReturnRequest ? "it_received_return" : "it_fulfilled",
+            actor,
+            role,
+            fromStatus,
+            request.Status,
+            "approved",
+            dto.Comment,
+            cancellationToken);
 
         return Ok(request);
     }
@@ -515,7 +603,11 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "IT close is only valid when fulfilled or pending_it_fulfillment." });
         }
 
-        if (!IsIt(Normalize(dto.ActorRole)))
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
+
+        if (!IsIt(role))
         {
             return Forbid();
         }
@@ -527,14 +619,14 @@ public class AssetRequestsController : ControllerBase
         request.ClosedAt = now;
         request.UpdatedAt = now;
 
-        _db.AssetRequestApprovals.Add(NewApproval(id, "it", dto.ActorEmail, "approved", dto.Comment));
+        _db.AssetRequestApprovals.Add(NewApproval(id, "it", actor, "approved", dto.Comment));
 
         await AddNotificationAsync(id, request.RequesterEmail, "in_app", "closed", cancellationToken);
         await AddNotificationAsync(id, request.PmApproverEmail, "in_app", "closed", cancellationToken);
         await AddNotificationAsync(id, request.BossApproverEmail, "in_app", "closed", cancellationToken);
 
         await _db.SaveChangesAsync(cancellationToken);
-        await WriteAuditAsync(request, "it_closed", dto.ActorEmail, dto.ActorRole, fromStatus, request.Status, "approved", dto.Comment, cancellationToken);
+        await WriteAuditAsync(request, "it_closed", actor, role, fromStatus, request.Status, "approved", dto.Comment, cancellationToken);
         return Ok(request);
     }
 
@@ -549,18 +641,22 @@ public class AssetRequestsController : ControllerBase
             return BadRequest(new { error = "Comment is required." });
         }
 
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var role = await GetActorRoleAsync(actor, cancellationToken);
+
         var row = new AssetRequestCommentEntity
         {
             Id = Guid.NewGuid().ToString("N"),
             RequestId = id,
-            AuthorEmail = dto.AuthorEmail.Trim(),
+            AuthorEmail = actor,
             Comment = dto.Comment.Trim(),
             CreatedAt = DateTimeOffset.UtcNow
         };
 
         _db.AssetRequestComments.Add(row);
         await _db.SaveChangesAsync(cancellationToken);
-        await WriteAuditAsync(request, "commented", dto.AuthorEmail, null, request.Status, request.Status, null, dto.Comment, cancellationToken);
+        await WriteAuditAsync(request, "commented", actor, role, request.Status, request.Status, null, dto.Comment, cancellationToken);
 
         return Ok(row);
     }
@@ -584,21 +680,22 @@ public class AssetRequestsController : ControllerBase
         {
             await _emailService.SendAsync(new SendEmailRequest(dto.RecipientEmail, dto.Subject, dto.Html), cancellationToken);
             notification.Status = "sent";
-            await _db.SaveChangesAsync(cancellationToken);
         }
+
+        await _db.SaveChangesAsync(cancellationToken);
 
         return Ok(notification);
     }
 
     [HttpGet("pending/me")]
-    public async Task<IActionResult> PendingMe([FromQuery] string email, [FromQuery] string? role, CancellationToken cancellationToken)
+    public async Task<IActionResult> PendingMe([FromQuery] string? role, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(email) && string.IsNullOrWhiteSpace(role))
-        {
-            return BadRequest(new { error = "email or role is required." });
-        }
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
 
-        var normalizedRole = Normalize(role);
+        var normalizedRole = string.IsNullOrWhiteSpace(role)
+            ? await GetActorRoleAsync(actor, cancellationToken)
+            : Normalize(role);
         var query = _db.AssetRequests.AsNoTracking().AsQueryable();
 
         if (IsIt(normalizedRole))
@@ -607,7 +704,6 @@ public class AssetRequestsController : ControllerBase
         }
         else
         {
-            var actor = email?.Trim() ?? string.Empty;
             query = query.Where(x =>
                 (x.Status == "pending_pm" && x.PmApproverEmail == actor)
                 || (x.Status == "pending_boss" && x.BossApproverEmail == actor)
@@ -619,10 +715,13 @@ public class AssetRequestsController : ControllerBase
     }
 
     [HttpGet("summary/me")]
-    public async Task<IActionResult> SummaryMe([FromQuery] string email, [FromQuery] string? role, CancellationToken cancellationToken)
+    public async Task<IActionResult> SummaryMe([FromQuery] string? role, CancellationToken cancellationToken)
     {
-        var actor = email?.Trim() ?? string.Empty;
-        var normalizedRole = Normalize(role);
+        var actor = GetActorEmail();
+        if (string.IsNullOrWhiteSpace(actor)) return Unauthorized(new { error = "Authenticated user email is required." });
+        var normalizedRole = string.IsNullOrWhiteSpace(role)
+            ? await GetActorRoleAsync(actor, cancellationToken)
+            : Normalize(role);
 
         var mine = await _db.AssetRequests.AsNoTracking().CountAsync(x => x.RequesterEmail == actor, cancellationToken);
         var pendingMine = await _db.AssetRequests.AsNoTracking().CountAsync(
@@ -694,7 +793,7 @@ public class AssetRequestsController : ControllerBase
         };
 
         _db.AssetRequestNotifications.Add(row);
-        await _db.SaveChangesAsync(cancellationToken);
+        await Task.CompletedTask;
         return row;
     }
 
@@ -786,5 +885,24 @@ public class AssetRequestsController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
         return value.Trim();
+    }
+
+    private string? GetActorEmail()
+    {
+        return User.FindFirstValue(ClaimTypes.Email)
+               ?? User.FindFirstValue("preferred_username")
+               ?? User.FindFirstValue("upn")
+               ?? User.FindFirstValue("unique_name");
+    }
+
+    private async Task<string> GetActorRoleAsync(string actorEmail, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(actorEmail)) return "user";
+        var role = await _db.Users.AsNoTracking()
+            .Where(x => x.Email == actorEmail)
+            .Select(x => x.Role)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        return string.IsNullOrWhiteSpace(role) ? "user" : Normalize(role);
     }
 }
